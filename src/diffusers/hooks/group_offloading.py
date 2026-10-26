@@ -324,6 +324,11 @@ class ModuleGroup:
                         _restore_torchao_tensor(param, self.cpu_param_dict[param])
                     else:
                         param.data = self.cpu_param_dict[param]
+                for buffer in group_module.buffers():
+                    if _is_torchao_tensor(buffer):
+                        _restore_torchao_tensor(buffer, self.cpu_param_dict[buffer])
+                    else:
+                        buffer.data = self.cpu_param_dict[buffer]
             for param in self.parameters:
                 if _is_torchao_tensor(param):
                     _restore_torchao_tensor(param, self.cpu_param_dict[param])
