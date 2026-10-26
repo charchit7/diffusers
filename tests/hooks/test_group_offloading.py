@@ -139,6 +139,43 @@ class DummyModelWithLayerNorm(ModelMixin):
         return x
 
 
+class DummyBlockWithBuffer(torch.nn.Module):
+    def __init__(self, in_features: int, hidden_features: int, out_features: int) -> None:
+        super().__init__()
+
+        self.proj_in = torch.nn.Linear(in_features, hidden_features)
+        self.activation = torch.nn.ReLU()
+        self.proj_out = torch.nn.Linear(hidden_features, out_features)
+        self.register_buffer("scale", torch.randn(hidden_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj_in(x)
+        x = self.activation(x)
+        x = x * self.scale
+        x = self.proj_out(x)
+        return x
+
+
+class DummyModelWithBlockBuffers(ModelMixin):
+    def __init__(self, in_features: int, hidden_features: int, out_features: int, num_layers: int) -> None:
+        super().__init__()
+
+        self.linear_1 = torch.nn.Linear(in_features, hidden_features)
+        self.activation = torch.nn.ReLU()
+        self.blocks = torch.nn.ModuleList(
+            [DummyBlockWithBuffer(hidden_features, hidden_features, hidden_features) for _ in range(num_layers)]
+        )
+        self.linear_2 = torch.nn.Linear(hidden_features, out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear_1(x)
+        x = self.activation(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.linear_2(x)
+        return x
+
+
 class DummyPipeline(DiffusionPipeline):
     model_cpu_offload_seq = "model"
 
@@ -443,6 +480,42 @@ class TestGroupOffload:
                 absmax = absdiff.max().item()
                 cumulated_absmax += absmax
             assert cumulated_absmax < 1e-5, f"Output differences for {name} exceeded threshold: {cumulated_absmax:.5f}"
+
+    def test_block_level_stream_offloads_block_buffers(self):
+        # With streams, offloading must move both the parameters and the buffers of grouped
+        # modules back to the offload device.
+        if torch.device(torch_device).type not in ["cuda", "xpu"]:
+            return
+
+        torch.manual_seed(0)
+        model = DummyModelWithBlockBuffers(
+            in_features=self.in_features,
+            hidden_features=self.hidden_features,
+            out_features=self.out_features,
+            num_layers=self.num_layers,
+        )
+        torch.manual_seed(0)
+        model_ref = DummyModelWithBlockBuffers(
+            in_features=self.in_features,
+            hidden_features=self.hidden_features,
+            out_features=self.out_features,
+            num_layers=self.num_layers,
+        )
+        model_ref.to(torch_device)
+
+        model.enable_group_offload(torch_device, offload_type="block_level", num_blocks_per_group=1, use_stream=True)
+
+        with torch.no_grad():
+            for _ in range(2):
+                out_ref = model_ref(self.input)
+                out = model(self.input)
+                assert torch.allclose(out_ref, out, atol=1e-5), "Outputs do not match with buffers in grouped blocks."
+
+        for block in model.blocks:
+            for param in block.parameters():
+                assert param.device.type == "cpu", f"Parameter still on {param.device} after offload."
+            for buffer in block.buffers():
+                assert buffer.device.type == "cpu", f"Buffer still on {buffer.device} after offload."
 
     def test_vae_like_model_without_streams(self):
         """Test VAE-like model with block-level offloading but without streams."""
